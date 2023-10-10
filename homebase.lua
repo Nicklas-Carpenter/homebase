@@ -13,8 +13,12 @@
 -- TODO Re the `nil`/unitialized value issue: if we do use exceptions, remember
 -- that exceptions are exceptional (looking at you ... Python)
 
+-- When the following line is uncommented, we use a debug-capable version of
+-- lpeg
+package.cpath = "./?.so;" .. package.cpath
 local lpeg      = require("lpeg")
 local  C        =  lpeg.C
+local  Cmt      =  lpeg.Cmt
 local  Ct       =  lpeg.Ct
 local  P        =  lpeg.P
 local  R        =  lpeg.R
@@ -25,6 +29,7 @@ local  pt       =  libpt.pt
 local peg_debug = require("pegdebug")
 local  trace    =  peg_debug.trace
 
+local exit      = os.exit
 local format    = string.format
 local insert    = table.insert
 local open      = io.open
@@ -32,7 +37,6 @@ local os_exec   = os.execute
 local read      = io.read
 local stdout    = io.stdout
 local unpack    = table.unpack
-
 
 -- Utility functions
 
@@ -109,8 +113,8 @@ local function var_expr_ast_node(iden_str)
     return {
         tag = "var_expr",
         iden_str = iden_str,
-        exec = function(self, env)
-            local val = env[self.iden_str]
+        exec = function(self, state)
+            local val = state.env[self.iden_str]
 
             -- TODO Add better error handling.
             -- TODO Probably need to revisit this if/when we add boolean values
@@ -135,8 +139,8 @@ local bin_ops = {
     ["=="] = function(oper1, oper2) return oper1 == oper2 and 1 or 0 end,
     ["!="] = function(oper1, oper2) return oper1 ~= oper2 and 1 or 0 end,
 }
-local function bin_expr_eval_fn(self, env)
-    return bin_ops[self.bin_op](self.oper1:exec(env), self.oper2:exec(env))
+local function bin_expr_eval_fn(self, state)
+    return bin_ops[self.bin_op](self.oper1:exec(state), self.oper2:exec(state))
 end
 
 local function fold_bin(syms)
@@ -165,7 +169,7 @@ local function let_stmt_ast_node(iden_str, expr)
         tag = "let_stmt",
         iden_str = iden_str,
         expr = expr,
-        exec = function(self, env)
+        exec = function(self, state)
             -- TODO Reconsider metatable since it doesn't seem to be helpful
             -- and it looks like I have to bypass it anyway.
             --
@@ -175,7 +179,7 @@ local function let_stmt_ast_node(iden_str, expr)
             --
             -- TODO Make a decision about this whether redeclaration should
             -- throw an error.
-            assertf(not rawget(env, self.iden_str),
+            assertf(not rawget(state.env, self.iden_str),
                     "Error: Attempting to redeclare variable '%s'",
                     self.iden_str)
 
@@ -195,9 +199,9 @@ local function let_stmt_ast_node(iden_str, expr)
                 --
                 -- TODO Consider revisiting use of `false` to mark declared but
                 -- undefined variables
-                env[self.iden_str] = false
+                state.env[self.iden_str] = false
             else
-                env[self.iden_str] = self.expr:exec(env)
+                state.env[self.iden_str] = self.expr:exec(state)
             end
 
         end
@@ -209,7 +213,7 @@ local function asgn_stmt_ast_node(iden_str, expr)
         tag = "asgn_stmt",
         iden_str = iden_str,
         expr = expr,
-        exec = function(self, env)
+        exec = function(self, state)
             -- TODO Feels like I'm adding a lot of hacks. Revisit this solution.
             --
             -- TODO Add better error handling and think about globals and scope
@@ -217,19 +221,32 @@ local function asgn_stmt_ast_node(iden_str, expr)
             -- non-let assignments of variables
             --
             -- TODO Probably need to revisit this if/when we add boolean values
-            assertf(env[self.iden_str] ~= nil,
-                    "Error: Undefined variable '%s'", self.iden)
-            set_existing_var_in(env, self.iden_str, self.expr:exec(env))
+            assertf(state.env[self.iden_str] ~= nil,
+                    "Error: Undefined variable '%s'", self.iden_str)
+            set_existing_var_in(state.env, self.iden_str, self.expr:exec(state))
         end
     }
 end
 
+-- Cheaty little hack. It's okay since we added the print expression here to
+-- assist in test and debugging.
+local prt_idx = 0
 local function prt_stmt_ast_node(expr)
     return {
         tag = "prt_stmt",
         expr = expr,
-        exec = function(self, env)
-            printf("@: %s", self.expr:exec(env))
+        exec = function(self, state)
+            local value
+            -- TODO Need to check for string dues to weird quirk in how LPEG
+            -- seems to parse print statement with empty expressions. Fix this
+            -- when possible.
+            if type(self.expr) == "string" then
+                value = ""
+            else
+                value = self.expr:exec(state)
+            end
+            printf("<%d>: %s", prt_idx, value)
+            prt_idx = prt_idx + 1
         end
     }
 end
@@ -238,9 +255,13 @@ local function stml_ast_node(stmts)
     return {
         tag = "stml",
         stmts = stmts,
-        exec = function(self, env)
+        exec = function(self, state)
             for _,stmt in ipairs(self.stmts) do
-                stmt:exec(env)
+                -- TODO This is specifically to handle comments. Find a better
+                -- way to filter out comments
+                if type(stmt) == "table" then
+                    stmt:exec(state)
+                end
             end
         end
     }
@@ -253,18 +274,18 @@ local function if_cnd_stmt_ast_node(test_expr, pass_stmts, elseifs, fail_stmts)
         pass_stmts = pass_stmts,
         elseifs = elseifs,
         fail_stmts = fail_stmts,
-        exec = function(self, env)
-            if self.test_expr:exec(env) ~= 0 then
-                self.pass_stmts:exec(env)
+        exec = function(self, state)
+            if self.test_expr:exec(state) ~= 0 then
+                self.pass_stmts:exec(state)
             else
                 for _,elif in ipairs(self.elseifs) do
-                    if elif[1]:exec(env) ~= 0 then
-                        elif[2]:exec(env)
+                    if elif[1]:exec(state) ~= 0 then
+                        elif[2]:exec(state)
                         return
                     end
                 end
 
-                fail_stmts:exec(env)
+                fail_stmts:exec(state)
             end
         end
     }
@@ -275,9 +296,9 @@ local function whl_stmt_ast_node(test_expr, body_stmts)
         tag = "whl_stmt",
         test_expr = test_expr,
         body_stmts = body_stmts,
-        exec = function(self, env)
-            while test_expr:exec(env) ~= 0 do
-                self.body_stmts:exec(env)
+        exec = function(self, state)
+            while test_expr:exec(state) ~= 0 do
+                self.body_stmts:exec(state)
             end
         end
     }
@@ -287,20 +308,34 @@ local function do_blk_stmt_ast_node(stmts)
     return {
         tag = "do_blk_stmt",
         stmts = stmts,
-        exec = function(self, env)
-            local n_env = extend_env(env)
-            stmts:exec(n_env)
+        exec = function(self, state)	
+            local old_env = state.env 
+            state.env = extend_env(old_env)
+            stmts:exec(state)
+            state.env = old_env
         end
     }
 end
 
+-- #TODO Random related question to look into. Why can closures in Lua only
+-- refer to variables in their closing scope that were defined sequentially
+-- before they were?
 local function fn_proto_stmt_ast_node(body_stmts)
     return {
         tag = "fn_proto_stmt",
         body_stmts = body_stmts,
+	exec = function(self, state)
+	end
     }
 end
 
+local function test_com(s, i, caps)
+    printf("Found comment starting at index %d", i - 1)
+    printf("Next char is '%s'", s:sub(i, i))
+    return true
+end
+
+local line_end = S("\r\n")
 local sp = S(" \t\r\n")^0
 
 local dec_dig= R("09")
@@ -317,7 +352,7 @@ local var_expr = iden1 / var_expr_ast_node
 
 -- Sanity check for keywords
 local keywords = {
-    "if", "then", "elseif", "else", "end", "while", "do", "print", "let"
+    "if", "then", "elseif", "else", "end", "while", "do", "print", "let", "fn"
 }
 
 local keyword = P(false)
@@ -362,6 +397,8 @@ local if_cnd_stmt = V("if_cnd_stmt")
 local whl_stmt = V("whl_stmt")
 local do_blk_stmt = V("do_blk_stmt")
 
+local comment = V("comment")
+
 local grammar_table = {"prog",
     expr = bin_expr + prim_expr,
     prim_expr = num_expr + ("(" * expr * ")") + var_expr,
@@ -374,7 +411,8 @@ local grammar_table = {"prog",
     -- Use sp instead of stmt1 to allow for programs composed of only spaces to
     -- be considered valid programs.
     -- TODO Support the empty statement (e.g. just  a ';')?
-    stml = sp * Ct((blk_stmt + reg_stmt)^1) / stml_ast_node,
+    -- TODO Reconsider how comments are included?
+    stml = sp * Ct((blk_stmt + reg_stmt + comment)^1) / stml_ast_node,
     reg_stmt = stmt1 * ";" * sp,
     stmt = asgn_stmt + prt_stmt + let_stmt,
 
@@ -394,7 +432,13 @@ local grammar_table = {"prog",
     let_stmt = K"let" * iden1 * ("=" * expr1)^-1 / let_stmt_ast_node,
     asgn_stmt = iden1 * "=" * expr / asgn_stmt_ast_node,
 
-    prt_stmt = K"print" * expr1 / prt_stmt_ast_node,
+    -- Allow print statements to be devoid of an expressions so we can print
+    -- blank lines in our Homebase programs.
+    --
+    -- TODO For some reason, LPEG captures the string 'print' if it tries to
+    -- parse a print statement with an empty expression. Figure out how to fix
+    -- this.
+    prt_stmt = K"print" * expr1^-1  / prt_stmt_ast_node,
 
     blk_stmt = if_cnd_stmt + whl_stmt + do_blk_stmt,
     if_cnd_stmt = K"if" * expr1 * K"then" * stml
@@ -406,11 +450,15 @@ local grammar_table = {"prog",
     fn_proto_stmt = K"fn" * sp * "(" * sp * ")" * stml * K"end"
                     / fn_proto_stmt_ast_node,
 
+    comment = "#" * (1 - line_end)^0 * line_end, 
+
     -- TODO Support the empty program.
     prog = stml + expr,
 }
 --grammar_table = trace(grammar_table) -- For debugging lexer/parser matching
 local grammar = P(grammar_table) * -1
+
+--grammar:pcode()
 
 local function parse(input)
     local ast = grammar:match(input)
@@ -422,8 +470,8 @@ local function parse(input)
     return ast
 end
 
-local function exec(ast, env)
-    return ast:exec(env)
+local function exec(ast, state)
+    return ast:exec(state)
 end
 
 -- Application section
@@ -481,10 +529,17 @@ repeat
         return
     end
 
-    local initial_env = new_env()
-    local result = exec(ast, initial_env)
+    -- TODO Right now we seperate variables and functions. We may not want to
+    -- do this in the future.
+    local initial_state = {
+        env = new_env(),
+        funcs = {},
+        cur_fn = nil,
+
+    }
+    local result = exec(ast, initial_state)
     printf("Result: %s", result)
 
     print("Final environment:")
-    print(pt(initial_env))
+    print(pt(initial_state.env))
 until interactive == false
