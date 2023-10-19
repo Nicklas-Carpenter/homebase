@@ -179,8 +179,9 @@ local function let_stmt_ast_node(iden_str, expr)
             --
             -- TODO Make a decision about this whether redeclaration should
             -- throw an error.
-            assertf(not rawget(state.env, self.iden_str),
-                    "Error: Attempting to redeclare variable '%s'",
+            assertf(rawget(state.env, self.iden_str) == nil
+                    and state.protos[self.iden_str] == nil,
+                    "Error: Attempting to redeclare '%s'",
                     self.iden_str)
 
             -- We first test if there is an expression to assign to the new
@@ -221,6 +222,9 @@ local function asgn_stmt_ast_node(iden_str, expr)
             -- non-let assignments of variables
             --
             -- TODO Probably need to revisit this if/when we add boolean values
+            assertf(state.proto[self.iden_str] == nil,
+                    "Error: Attempting to assign to function '%s'",
+                    self.iden_str)
             assertf(state.env[self.iden_str] ~= nil,
                     "Error: Undefined variable '%s'", self.iden_str)
             set_existing_var_in(state.env, self.iden_str, self.expr:exec(state))
@@ -247,6 +251,22 @@ local function prt_stmt_ast_node(expr)
             end
             printf("<%d>: %s", prt_idx, value)
             prt_idx = prt_idx + 1
+        end
+    }
+end
+
+local function call_stmt_ast_node(fn_name)
+    return {
+        tag = "call_stmt",
+        fn_name = fn_name,
+        exec = function(self, state)
+            assertf(state.env[self.fn_name] == nil,
+                    "Error: '%s' is not a function", self.fn_name)
+            assertf(state.protos[self.fn_name] ~= nil,
+                    "Error: Undefined function '%s'", self.fn_name)
+
+            local fn = state.protos[self.fn_name]
+            fn.body:exec(state)
         end
     }
 end
@@ -308,8 +328,8 @@ local function do_blk_stmt_ast_node(stmts)
     return {
         tag = "do_blk_stmt",
         stmts = stmts,
-        exec = function(self, state)	
-            local old_env = state.env 
+        exec = function(self, state)
+            local old_env = state.env
             state.env = extend_env(old_env)
             stmts:exec(state)
             state.env = old_env
@@ -320,12 +340,18 @@ end
 -- #TODO Random related question to look into. Why can closures in Lua only
 -- refer to variables in their closing scope that were defined sequentially
 -- before they were?
-local function fn_proto_stmt_ast_node(body_stmts)
+local function fn_proto_stmt_ast_node(name, body_stmts)
     return {
         tag = "fn_proto_stmt",
+        name = name,
         body_stmts = body_stmts,
-	exec = function(self, state)
-	end
+	    exec = function(self, state)
+            assertf(state.env[self.name] == nil,
+                    "Error: Attempting to redeclare '%s'", self.name)
+            state.protos[self.name] = {
+                body = body_stmts,
+            }
+	    end
     }
 end
 
@@ -397,6 +423,9 @@ local if_cnd_stmt = V("if_cnd_stmt")
 local whl_stmt = V("whl_stmt")
 local do_blk_stmt = V("do_blk_stmt")
 
+local fn_proto_stmt = V("fn_proto_stmt")
+local call_stmt = V("call_stmt")
+
 local comment = V("comment")
 
 local grammar_table = {"prog",
@@ -414,7 +443,7 @@ local grammar_table = {"prog",
     -- TODO Reconsider how comments are included?
     stml = sp * Ct((blk_stmt + reg_stmt + comment)^1) / stml_ast_node,
     reg_stmt = stmt1 * ";" * sp,
-    stmt = asgn_stmt + prt_stmt + let_stmt,
+    stmt = asgn_stmt + prt_stmt + let_stmt + call_stmt,
 
     -- TODO Right now, if a variable is declared in some outer scope, in an
     -- inner scope we can reassign the variable *and then* declare a new
@@ -440,17 +469,19 @@ local grammar_table = {"prog",
     -- this.
     prt_stmt = K"print" * expr1^-1  / prt_stmt_ast_node,
 
-    blk_stmt = if_cnd_stmt + whl_stmt + do_blk_stmt,
+    call_stmt = iden1 * "(" * sp * ")" / call_stmt_ast_node,
+
+    blk_stmt = if_cnd_stmt + whl_stmt + do_blk_stmt + fn_proto_stmt,
     if_cnd_stmt = K"if" * expr1 * K"then" * stml
                     * Ct(Ct(K"elseif" * expr1 * K"then" * stml)^0)
                     * (K"else" * stml)^-1 * K"end" / if_cnd_stmt_ast_node,
     whl_stmt = K"while" * expr1 * K"do" * stml * K"end" / whl_stmt_ast_node,
     do_blk_stmt = K"do" * stml * K"end" / do_blk_stmt_ast_node,
 
-    fn_proto_stmt = K"fn" * sp * "(" * sp * ")" * stml * K"end"
+    fn_proto_stmt = K"fn" * iden1 * "(" * sp * ")" * stml * K"end"
                     / fn_proto_stmt_ast_node,
 
-    comment = "#" * (1 - line_end)^0 * line_end, 
+    comment = "#" * (1 - line_end)^0 * line_end,
 
     -- TODO Support the empty program.
     prog = stml + expr,
@@ -533,13 +564,13 @@ repeat
     -- do this in the future.
     local initial_state = {
         env = new_env(),
-        funcs = {},
+        protos = {},
         cur_fn = nil,
 
     }
     local result = exec(ast, initial_state)
     printf("Result: %s", result)
 
-    print("Final environment:")
-    print(pt(initial_state.env))
+    print("Final state:")
+    print(pt(initial_state))
 until interactive == false
