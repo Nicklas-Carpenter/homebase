@@ -84,6 +84,56 @@ local function extend_env(old_env, ...)
     return n_env
 end
 
+-- Creating a shared exec function for call expressions and statements since
+-- the only difference is that call statements discard the callee's return
+-- value
+local function exec_call(self, state)
+    assertf(state.env[self.fn_name] == nil,
+            "Error: '%s' is not a function", self.fn_name)
+    assertf(state.protos[self.fn_name] ~= nil,
+            "Error: Undefined function '%s'", self.fn_name)
+
+    local proto = state.protos[self.fn_name]
+
+
+    -- TODO Right now we're inserting params into the environment, but we might
+    -- want to do it differently in the future.
+    --
+    -- TODO Also, another instance where we're bypassing the traditional
+    -- methods defined for the environment. Time to reconsider its
+    -- implementation?
+    --
+    -- TODO Also also, currently we just ignore extra arguments and formal
+    -- parameters that don't have an accompanying argument. This is similar to
+    -- how Lua does it, but we might want to do it differently.
+    local func_env = new_env()
+    for i = 1, #proto.formal_params do
+        func_env[proto.formal_params[i]] = self.args[i]:exec(state)
+    end
+
+    -- Create new state for function, with a new environment but the same
+    -- prototype definitions.
+    --
+    -- TODO Eventually want to be able to refer to variables within the
+    -- enclosing scope of the prototype, similar to how Lua does it. Holding
+    -- off for now since I want to understand what I'm doing first.
+    --
+    -- TODO Currently, this leads to an awkward situation where functions
+    -- defined within functions can be called by functions defined in the
+    -- outermost scope; that is, a function defined anywhere can be called
+    -- anywhere assuming the prototype statement has been executed at call
+    -- time. Figure out what to do with this; I don't like it as it is now.
+    -- Resolution will probably go hand-in-hand with the other scoping changes
+    -- I want done.
+    local func_scope = {
+        env = func_env,
+        protos = state.protos
+    }
+
+    return proto.body:exec(func_scope)
+end
+
+
 -- TODO It's late. I'm tired. Probably need to revisit this.
 -- TODO If I keep this function, it probably needs better error handling.
 local function set_existing_var_in(env, var, val)
@@ -162,6 +212,15 @@ local function fold_bin(syms)
     end
 
     return cur_expr
+end
+
+local function call_expr_ast_node(fn_name, args)
+    return {
+        tag = "call_expr",
+        fn_name = fn_name,
+        args = args,
+        exec = exec_call
+    }
 end
 
 local function let_stmt_ast_node(iden_str, expr)
@@ -255,18 +314,24 @@ local function prt_stmt_ast_node(expr)
     }
 end
 
-local function call_stmt_ast_node(fn_name)
+local function call_stmt_ast_node(fn_name, args)
     return {
         tag = "call_stmt",
         fn_name = fn_name,
-        exec = function(self, state)
-            assertf(state.env[self.fn_name] == nil,
-                    "Error: '%s' is not a function", self.fn_name)
-            assertf(state.protos[self.fn_name] ~= nil,
-                    "Error: Undefined function '%s'", self.fn_name)
+        args = args,
+        exec = function(self, state) exec_call(self, state) end
+    }
+end
 
-            local fn = state.protos[self.fn_name]
-            fn.body:exec(state)
+-- TODO Currently, due to how returns are handled, attempting to return a
+-- function that doesn't explicitly return a value fails to actually return;
+-- execution continues at the next statement.
+local function ret_stmt_ast_node(expr)
+    return {
+        tag = "ret_stmt",
+        expr = expr,
+        exec = function(self, state)
+            return self.expr:exec(state)
         end
     }
 end
@@ -280,7 +345,22 @@ local function stml_ast_node(stmts)
                 -- TODO This is specifically to handle comments. Find a better
                 -- way to filter out comments
                 if type(stmt) == "table" then
-                    stmt:exec(state)
+                    -- Note that expression in Homebase should always be
+                    -- captured by a statement and therefore we shouldn't need
+                    -- to worry about expressions here.
+                    -- TODO What about call statements.
+                    -- TODO We may also have an issue with return statements
+                    -- that have empty expresssions.
+                    --
+                    -- TODO Right now the only type of statement that can
+                    -- return a value is a "return" statement. We're basically
+                    -- checking for early returns here. Is there a better way
+                    -- to do this (that doesn't involve continuations -- I want
+                    -- to try those at some point but not now).
+                    local val = stmt:exec(state)
+                    if val ~= nil then
+                        return val
+                    end
                 end
             end
         end
@@ -296,16 +376,25 @@ local function if_cnd_stmt_ast_node(test_expr, pass_stmts, elseifs, fail_stmts)
         fail_stmts = fail_stmts,
         exec = function(self, state)
             if self.test_expr:exec(state) ~= 0 then
-                self.pass_stmts:exec(state)
+                local val = self.pass_stmts:exec(state)
+                if val ~= nil then
+                    return val
+                end
             else
                 for _,elif in ipairs(self.elseifs) do
                     if elif[1]:exec(state) ~= 0 then
-                        elif[2]:exec(state)
+                        local val = elif[2]:exec(state)
+                        if val ~= nil then
+                            return val
+                        end
                         return
                     end
                 end
 
-                fail_stmts:exec(state)
+                local val =  fail_stmts:exec(state)
+                if val ~= nil then
+                    return val
+                end
             end
         end
     }
@@ -318,7 +407,10 @@ local function whl_stmt_ast_node(test_expr, body_stmts)
         body_stmts = body_stmts,
         exec = function(self, state)
             while test_expr:exec(state) ~= 0 do
-                self.body_stmts:exec(state)
+                local val = self.body_stmts:exec(state)
+                if val ~= nil then
+                    return val
+                end
             end
         end
     }
@@ -340,16 +432,18 @@ end
 -- #TODO Random related question to look into. Why can closures in Lua only
 -- refer to variables in their closing scope that were defined sequentially
 -- before they were?
-local function fn_proto_stmt_ast_node(name, body_stmts)
+local function fn_proto_stmt_ast_node(name, formal_params, body_stmts)
     return {
         tag = "fn_proto_stmt",
         name = name,
+        formal_params = formal_params,
         body_stmts = body_stmts,
 	    exec = function(self, state)
             assertf(state.env[self.name] == nil,
                     "Error: Attempting to redeclare '%s'", self.name)
             state.protos[self.name] = {
                 body = body_stmts,
+                formal_params = formal_params
             }
 	    end
     }
@@ -371,14 +465,14 @@ local alpha = R("az", "AZ")
 local alnum = alpha + dec_dig
 
 local iden_char = alnum + "_"
-local iden = C((alpha + "_") * iden_char^0)
-local iden1 = sp * iden * sp
+local iden = sp * C((alpha + "_") * iden_char^0) * sp
 
-local var_expr = iden1 / var_expr_ast_node
+local var_expr = iden / var_expr_ast_node
 
 -- Sanity check for keywords
 local keywords = {
-    "if", "then", "elseif", "else", "end", "while", "do", "print", "let", "fn"
+    "if", "then", "elseif", "else", "end", "while", "do", "print", "let", "fn",
+    "return",
 }
 
 local keyword = P(false)
@@ -390,13 +484,17 @@ local function K(kw_str)
     return sp * kw_str * -iden_char * sp -- -iden prevents keyword run-together
 end
 
-local expr = V("expr")
-local expr1 = sp * expr * sp
+-- Genericize the pattern for a call so we can support call expressions (calls
+-- that return their functions return value) and call statements (calls where
+-- the function's return value is discarded.)
+local call = sp * V("call") * sp
 
-local prim_expr = V("prim_expr")
-local prim1_expr = sp * prim_expr * sp
+local expr = sp * V("expr") * sp
 
-local bin_expr = V("bin_expr")
+local prim_expr = sp * V("prim_expr") * sp
+
+local bin_expr = sp * V("bin_expr") * sp
+local term = sp * V("term") * sp
 
 -- TODO Currently, Homebase uses 0 and not-0 as its boolean operands.
 -- Expression priorities establishing order of operation. Lower ordinal values
@@ -408,15 +506,17 @@ local p0_bin_expr = sp * V("p0_bin_expr") * sp -- Multiply-like operations
 local p1_bin_expr = sp * V("p1_bin_expr") * sp -- Add-like operations
 local p2_bin_expr = sp * V("p2_bin_expr") * sp -- Comparison operations
 
-local stmt = V("stmt")
-local stmt1 = sp * stmt * sp
+local call_expr = V("call_expr")
 
-local stml = V("stml")
+local stmt = sp * V("stmt") * sp
+
+local stml = sp * V("stml") * sp
 
 local reg_stmt = V("reg_stmt")
 local let_stmt = V("let_stmt")
 local asgn_stmt = V("asgn_stmt")
 local prt_stmt = V("prt_stmt")
+local ret_stmt = V("ret_stmt")
 
 local blk_stmt = V("blk_stmt")
 local if_cnd_stmt = V("if_cnd_stmt")
@@ -429,21 +529,25 @@ local call_stmt = V("call_stmt")
 local comment = V("comment")
 
 local grammar_table = {"prog",
-    expr = bin_expr + prim_expr,
+    call = iden * "(" * sp * Ct(((expr * ",")^0 * expr)^0) * ")",
+
+    expr = call_expr + bin_expr + prim_expr,
     prim_expr = num_expr + ("(" * expr * ")") + var_expr,
 
     bin_expr = p2_bin_expr,
-    p0_bin_expr = Ct(prim1_expr * (p0_bin_op * prim1_expr)^0) / fold_bin,
+    term = call_expr + prim_expr,
+    p0_bin_expr = Ct(term * (p0_bin_op * term)^0) / fold_bin,
     p1_bin_expr = Ct(p0_bin_expr * (p1_bin_op * p0_bin_expr)^0) / fold_bin,
     p2_bin_expr = Ct(p1_bin_expr * (p2_bin_op * p1_bin_expr)^0) / fold_bin,
+    call_expr = call / call_expr_ast_node,
 
-    -- Use sp instead of stmt1 to allow for programs composed of only spaces to
+    -- Use sp instead of stmt to allow for programs composed of only spaces to
     -- be considered valid programs.
     -- TODO Support the empty statement (e.g. just  a ';')?
     -- TODO Reconsider how comments are included?
     stml = sp * Ct((blk_stmt + reg_stmt + comment)^1) / stml_ast_node,
-    reg_stmt = stmt1 * ";" * sp,
-    stmt = asgn_stmt + prt_stmt + let_stmt + call_stmt,
+    reg_stmt = stmt * ";" * sp,
+    stmt = asgn_stmt + prt_stmt + let_stmt + call_stmt + ret_stmt,
 
     -- TODO Right now, if a variable is declared in some outer scope, in an
     -- inner scope we can reassign the variable *and then* declare a new
@@ -458,8 +562,8 @@ local grammar_table = {"prog",
     --
     -- TODO Figure out what to do when declared but unassigned variable is accessed
     -- TODO Allow multi-assignment statements?
-    let_stmt = K"let" * iden1 * ("=" * expr1)^-1 / let_stmt_ast_node,
-    asgn_stmt = iden1 * "=" * expr / asgn_stmt_ast_node,
+    let_stmt = K"let" * iden * ("=" * expr)^-1 / let_stmt_ast_node,
+    asgn_stmt = iden * "=" * expr / asgn_stmt_ast_node,
 
     -- Allow print statements to be devoid of an expressions so we can print
     -- blank lines in our Homebase programs.
@@ -467,19 +571,21 @@ local grammar_table = {"prog",
     -- TODO For some reason, LPEG captures the string 'print' if it tries to
     -- parse a print statement with an empty expression. Figure out how to fix
     -- this.
-    prt_stmt = K"print" * expr1^-1  / prt_stmt_ast_node,
+    prt_stmt = K"print" * expr^-1  / prt_stmt_ast_node,
 
-    call_stmt = iden1 * "(" * sp * ")" / call_stmt_ast_node,
+    call_stmt = call / call_stmt_ast_node,
+
+    ret_stmt = K"return" * expr / ret_stmt_ast_node,
 
     blk_stmt = if_cnd_stmt + whl_stmt + do_blk_stmt + fn_proto_stmt,
-    if_cnd_stmt = K"if" * expr1 * K"then" * stml
-                    * Ct(Ct(K"elseif" * expr1 * K"then" * stml)^0)
+    if_cnd_stmt = K"if" * expr * K"then" * stml
+                    * Ct(Ct(K"elseif" * expr * K"then" * stml)^0)
                     * (K"else" * stml)^-1 * K"end" / if_cnd_stmt_ast_node,
-    whl_stmt = K"while" * expr1 * K"do" * stml * K"end" / whl_stmt_ast_node,
+    whl_stmt = K"while" * expr * K"do" * stml * K"end" / whl_stmt_ast_node,
     do_blk_stmt = K"do" * stml * K"end" / do_blk_stmt_ast_node,
 
-    fn_proto_stmt = K"fn" * iden1 * "(" * sp * ")" * stml * K"end"
-                    / fn_proto_stmt_ast_node,
+    fn_proto_stmt = K"fn" * iden * "(" * sp * Ct(((iden * ",")^0 * iden)^0)
+                    * ")" * stml * K"end" / fn_proto_stmt_ast_node,
 
     comment = "#" * (1 - line_end)^0 * line_end,
 
@@ -565,8 +671,6 @@ repeat
     local initial_state = {
         env = new_env(),
         protos = {},
-        cur_fn = nil,
-
     }
     local result = exec(ast, initial_state)
     printf("Result: %s", result)
