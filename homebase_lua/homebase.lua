@@ -149,10 +149,32 @@ local function set_existing_var_in(env, var, val)
     cur_scope[var] = val
 end
 
-local function num_expr_ast_node(num_str)
+local function int_lit_ast_node(num_str)
     return {
-        tag = "num_ast_node",
+        tag = "int_lit_ast_node",
         val = tonumber(num_str),
+        exec = function(self)
+            return self.val
+        end
+    }
+end
+
+local function toboolean(str)
+    printf("str = %s", str)
+    if str == "true" then return true end
+
+    if str ~= "false" then
+        errorf("Error: Invalid boolean value '%s'", str)
+    else
+        return false
+    end
+end
+
+local function bool_lit_ast_node(bool_str)
+    print("Caught bool const")
+    return {
+        tag = "bool_const_ast_node",
+        val = toboolean(bool_str),
         exec = function(self)
             return self.val
         end
@@ -182,14 +204,21 @@ local bin_ops = {
     ["*"] = function(oper1, oper2) return oper1 * oper2 end,
     ["/"] = function(oper1, oper2) return oper1 / oper2 end,
     ["%"] = function(oper1, oper2) return oper1 % oper2 end,
-    [">"] = function(oper1, oper2) return oper1 > oper2 and 1 or 0 end,
-    ["<"] = function(oper1, oper2) return oper1 < oper2 and 1 or 0 end,
-    [">="] = function(oper1, oper2) return oper1 >= oper2 and 1 or 0 end,
-    ["<="] = function(oper1, oper2) return oper1 <= oper2 and 1 or 0 end,
-    ["=="] = function(oper1, oper2) return oper1 == oper2 and 1 or 0 end,
-    ["!="] = function(oper1, oper2) return oper1 ~= oper2 and 1 or 0 end,
+    [">"] = function(oper1, oper2) return oper1 > oper2 end,
+    ["<"] = function(oper1, oper2) return oper1 < oper2 end,
+    [">="] = function(oper1, oper2) return oper1 >= oper2 end,
+    ["<="] = function(oper1, oper2) return oper1 <= oper2 end,
+    ["=="] = function(oper1, oper2) return oper1 == oper2 end,
+    ["!="] = function(oper1, oper2) return oper1 ~= oper2 end,
 }
 local function bin_expr_eval_fn(self, state)
+    local op_fn = bin_ops[self.bin_op]
+    local result = op_fn(self.oper1:exec(state), self.oper2:exec(state))
+
+    --if not ok then
+    --    errorf("Error: invalid operand for operation '%s'", self.bin_op)
+    --end
+
     return bin_ops[self.bin_op](self.oper1:exec(state), self.oper2:exec(state))
 end
 
@@ -281,7 +310,7 @@ local function asgn_stmt_ast_node(iden_str, expr)
             -- non-let assignments of variables
             --
             -- TODO Probably need to revisit this if/when we add boolean values
-            assertf(state.proto[self.iden_str] == nil,
+            assertf(state.protos[self.iden_str] == nil,
                     "Error: Attempting to assign to function '%s'",
                     self.iden_str)
             assertf(state.env[self.iden_str] ~= nil,
@@ -375,25 +404,21 @@ local function if_cnd_stmt_ast_node(test_expr, pass_stmts, elseifs, fail_stmts)
         elseifs = elseifs,
         fail_stmts = fail_stmts,
         exec = function(self, state)
-            if self.test_expr:exec(state) ~= 0 then
+            if self.test_expr:exec(state) then
                 local val = self.pass_stmts:exec(state)
                 if val ~= nil then
                     return val
                 end
             else
                 for _,elif in ipairs(self.elseifs) do
-                    if elif[1]:exec(state) ~= 0 then
+                    if elif[1]:exec(state) then
                         local val = elif[2]:exec(state)
-                        if val ~= nil then
-                            return val
-                        end
-                        return
+                        return elif[2]:exec(state)
                     end
                 end
 
-                local val =  fail_stmts:exec(state)
-                if val ~= nil then
-                    return val
+                if self.fail_stmts ~= nil then
+                    return self.fail_stmts:exec(state)
                 end
             end
         end
@@ -429,9 +454,13 @@ local function do_blk_stmt_ast_node(stmts)
     }
 end
 
--- #TODO Random related question to look into. Why can closures in Lua only
+-- TODO Random related question to look into. Why can closures in Lua only
 -- refer to variables in their closing scope that were defined sequentially
 -- before they were?
+--
+-- Answer: Probably has something to do with how the parser decides to create
+-- an upvalue (i.e. when defining an inner function it only creates upvalues
+-- for values defined up until that point)
 local function fn_proto_stmt_ast_node(name, formal_params, body_stmts)
     return {
         tag = "fn_proto_stmt",
@@ -459,7 +488,7 @@ local line_end = S("\r\n")
 local sp = S(" \t\r\n")^0
 
 local dec_dig= R("09")
-local num_expr = dec_dig^1 / num_expr_ast_node
+local int_lit = dec_dig^1 / int_lit_ast_node
 
 local alpha = R("az", "AZ")
 local alnum = alpha + dec_dig
@@ -472,7 +501,7 @@ local var_expr = iden / var_expr_ast_node
 -- Sanity check for keywords
 local keywords = {
     "if", "then", "elseif", "else", "end", "while", "do", "print", "let", "fn",
-    "return",
+    "return", "true", "false",
 }
 
 local keyword = P(false)
@@ -484,17 +513,15 @@ local function K(kw_str)
     return sp * kw_str * -iden_char * sp -- -iden prevents keyword run-together
 end
 
+local bool_lit = K"true" + K"false" / bool_lit_ast_node
+
 -- Genericize the pattern for a call so we can support call expressions (calls
 -- that return their functions return value) and call statements (calls where
 -- the function's return value is discarded.)
 local call = sp * V("call") * sp
 
 local expr = sp * V("expr") * sp
-
 local prim_expr = sp * V("prim_expr") * sp
-
-local bin_expr = sp * V("bin_expr") * sp
-local term = sp * V("term") * sp
 
 -- TODO Currently, Homebase uses 0 and not-0 as its boolean operands.
 -- Expression priorities establishing order of operation. Lower ordinal values
@@ -502,16 +529,15 @@ local term = sp * V("term") * sp
 local p0_bin_op = C(S("*/%"))
 local p1_bin_op = C(S("+-"))
 local p2_bin_op = C(P(">=") + "<=" + "==" + "!=" + ">" + "<")
-local p0_bin_expr = sp * V("p0_bin_expr") * sp -- Multiply-like operations
-local p1_bin_expr = sp * V("p1_bin_expr") * sp -- Add-like operations
-local p2_bin_expr = sp * V("p2_bin_expr") * sp -- Comparison operations
+local p0_expr = sp * V("p0_expr") * sp -- Multiply-like operations
+local p1_expr = sp * V("p1_expr") * sp -- Add-like operations
+local p2_expr = sp * V("p2_expr") * sp -- Comparison operations
 
+local test_expr = V("test_expr")
 local call_expr = V("call_expr")
 
 local stmt = sp * V("stmt") * sp
-
 local stml = sp * V("stml") * sp
-
 local reg_stmt = V("reg_stmt")
 local let_stmt = V("let_stmt")
 local asgn_stmt = V("asgn_stmt")
@@ -531,14 +557,14 @@ local comment = V("comment")
 local grammar_table = {"prog",
     call = iden * "(" * sp * Ct(((expr * ",")^0 * expr)^0) * ")",
 
-    expr = call_expr + bin_expr + prim_expr,
-    prim_expr = num_expr + ("(" * expr * ")") + var_expr,
+    expr = call_expr + p2_expr,
 
-    bin_expr = p2_bin_expr,
-    term = call_expr + prim_expr,
-    p0_bin_expr = Ct(term * (p0_bin_op * term)^0) / fold_bin,
-    p1_bin_expr = Ct(p0_bin_expr * (p1_bin_op * p0_bin_expr)^0) / fold_bin,
-    p2_bin_expr = Ct(p1_bin_expr * (p2_bin_op * p1_bin_expr)^0) / fold_bin,
+    prim_expr = int_lit + bool_lit + ("(" * expr * ")") + call_expr
+                + var_expr,
+    p0_expr = Ct(prim_expr * (p0_bin_op * prim_expr)^0) / fold_bin,
+    p1_expr = Ct(p0_expr * (p1_bin_op * p0_expr)^0) / fold_bin,
+    p2_expr = Ct(p1_expr * (p2_bin_op * p1_expr)^-1) / fold_bin,
+
     call_expr = call / call_expr_ast_node,
 
     -- Use sp instead of stmt to allow for programs composed of only spaces to
@@ -574,16 +600,13 @@ local grammar_table = {"prog",
     prt_stmt = K"print" * expr^-1  / prt_stmt_ast_node,
 
     call_stmt = call / call_stmt_ast_node,
-
     ret_stmt = K"return" * expr / ret_stmt_ast_node,
-
     blk_stmt = if_cnd_stmt + whl_stmt + do_blk_stmt + fn_proto_stmt,
     if_cnd_stmt = K"if" * expr * K"then" * stml
                     * Ct(Ct(K"elseif" * expr * K"then" * stml)^0)
                     * (K"else" * stml)^-1 * K"end" / if_cnd_stmt_ast_node,
     whl_stmt = K"while" * expr * K"do" * stml * K"end" / whl_stmt_ast_node,
     do_blk_stmt = K"do" * stml * K"end" / do_blk_stmt_ast_node,
-
     fn_proto_stmt = K"fn" * iden * "(" * sp * Ct(((iden * ",")^0 * iden)^0)
                     * ")" * stml * K"end" / fn_proto_stmt_ast_node,
 
@@ -666,6 +689,8 @@ repeat
         return
     end
 
+    local root_proto = 
+
     -- TODO Right now we seperate variables and functions. We may not want to
     -- do this in the future.
     local initial_state = {
@@ -675,6 +700,6 @@ repeat
     local result = exec(ast, initial_state)
     printf("Result: %s", result)
 
-    print("Final state:")
-    print(pt(initial_state))
+    --print("Final state:")
+    --print(pt(initial_state))
 until interactive == false
