@@ -32,6 +32,7 @@ local  trace    =  peg_debug.trace
 local exit      = os.exit
 local format    = string.format
 local insert    = table.insert
+local push      = insert
 local open      = io.open
 local os_exec   = os.execute
 local read      = io.read
@@ -84,6 +85,20 @@ local function extend_env(old_env, ...)
     return n_env
 end
 
+local function mk_proto(formal_params)
+    return {
+        formal_params = formal_params or {},
+        code = {},
+    }
+end
+
+local function mk_closure(proto)
+    return {
+        proto = proto,
+        env = {}
+    }
+end
+
 -- Creating a shared exec function for call expressions and statements since
 -- the only difference is that call statements discard the callee's return
 -- value
@@ -95,17 +110,9 @@ local function exec_call(self, state)
 
     local proto = state.protos[self.fn_name]
 
-
-    -- TODO Right now we're inserting params into the environment, but we might
-    -- want to do it differently in the future.
-    --
     -- TODO Also, another instance where we're bypassing the traditional
     -- methods defined for the environment. Time to reconsider its
     -- implementation?
-    --
-    -- TODO Also also, currently we just ignore extra arguments and formal
-    -- parameters that don't have an accompanying argument. This is similar to
-    -- how Lua does it, but we might want to do it differently.
     local func_env = new_env()
     for i = 1, #proto.formal_params do
         func_env[proto.formal_params[i]] = self.args[i]:exec(state)
@@ -133,7 +140,6 @@ local function exec_call(self, state)
     return proto.body:exec(func_scope)
 end
 
-
 -- TODO It's late. I'm tired. Probably need to revisit this.
 -- TODO If I keep this function, it probably needs better error handling.
 local function set_existing_var_in(env, var, val)
@@ -153,6 +159,11 @@ local function int_lit_ast_node(num_str)
     return {
         tag = "int_lit_ast_node",
         val = tonumber(num_str),
+        codegen = function(self, state)
+            local code = state.code
+            insert(code, "PUSH")
+            insert(code, self.val)
+        end,
         exec = function(self)
             return self.val
         end
@@ -173,8 +184,13 @@ end
 local function bool_lit_ast_node(bool_str)
     print("Caught bool const")
     return {
-        tag = "bool_const_ast_node",
+        tag = "bool_lit_ast_node",
         val = toboolean(bool_str),
+        codegen = function(self, state)
+            local code = state.code
+            insert(code, "PUSH")
+            insert(code, self.val)
+        end,
         exec = function(self)
             return self.val
         end
@@ -185,14 +201,15 @@ local function var_expr_ast_node(iden_str)
     return {
         tag = "var_expr",
         iden_str = iden_str,
+        codegen = function(self, state, stack)
+            local code = state.code
+            insert(code, "LOAD")
+            insert(code, self.iden_str)
+        end,
         exec = function(self, state)
             local val = state.env[self.iden_str]
-
-            -- TODO Add better error handling.
-            -- TODO Probably need to revisit this if/when we add boolean values
             assertf(val ~= nil, "Error: Undefined variable '%s'",
                     self.iden_str)
-
             return val
         end
     }
@@ -222,6 +239,17 @@ local function bin_expr_eval_fn(self, state)
     return bin_ops[self.bin_op](self.oper1:exec(state), self.oper2:exec(state))
 end
 
+local bin_op_instrs = {
+    ["+"] = "ADD", ["-"] = "SUB", ["*"] = "MUL", ["/"] = "DIV", ["%"] = "MOD",
+    [">"] = "GT", ["<"] = "LT", [">="] = "GTE", ["<="] = "LTE", ["=="] = "EQ",
+    ["!="] = "NEQ"
+}
+local function bin_expr_codegen(self, state)
+    self.oper1:codegen(state)  
+    self.oper2:codegen(state)  
+    insert(state.code, bin_op_instrs[self.bin_op])
+end
+
 local function fold_bin(syms)
     -- If there is only one item in the list, it is a primary expression, so
     -- we should just return it
@@ -236,6 +264,7 @@ local function fold_bin(syms)
             bin_op = syms[i],
             oper1 = cur_expr,
             oper2 = syms[i + 1],
+            codegen = jh
             exec = bin_expr_eval_fn
         }
     end
@@ -454,13 +483,6 @@ local function do_blk_stmt_ast_node(stmts)
     }
 end
 
--- TODO Random related question to look into. Why can closures in Lua only
--- refer to variables in their closing scope that were defined sequentially
--- before they were?
---
--- Answer: Probably has something to do with how the parser decides to create
--- an upvalue (i.e. when defining an inner function it only creates upvalues
--- for values defined up until that point)
 local function fn_proto_stmt_ast_node(name, formal_params, body_stmts)
     return {
         tag = "fn_proto_stmt",
@@ -477,6 +499,20 @@ local function fn_proto_stmt_ast_node(name, formal_params, body_stmts)
 	    end
     }
 end
+
+local function proto_expr_ast_node(formal_params, body_stmts)
+    return {
+        tag = "fn_proto_stmt",
+        name = name,
+        formal_params = formal_params,
+        body_stmts = body_stmts,
+	    codegen = function(self, state)
+            
+            formal_params =  
+        end
+    }
+end
+
 
 local function test_com(s, i, caps)
     printf("Found comment starting at index %d", i - 1)
@@ -523,7 +559,7 @@ local call = sp * V("call") * sp
 local expr = sp * V("expr") * sp
 local prim_expr = sp * V("prim_expr") * sp
 
--- TODO Currently, Homebase uses 0 and not-0 as its boolean operands.
+-- NOTE: Currently, Homebase uses 0 and not-0 as its boolean operands.
 -- Expression priorities establishing order of operation. Lower ordinal values
 -- indicate higher priority.
 local p0_bin_op = C(S("*/%"))
@@ -559,6 +595,9 @@ local grammar_table = {"prog",
 
     expr = call_expr + p2_expr,
 
+    proto_expr = K"fn" * "(" * sp * Ct(((iden * ",")^0 * iden)^0)
+                * stml * K"end" / proto_expr_ast_node
+
     prim_expr = int_lit + bool_lit + ("(" * expr * ")") + call_expr
                 + var_expr,
     p0_expr = Ct(prim_expr * (p0_bin_op * prim_expr)^0) / fold_bin,
@@ -575,17 +614,6 @@ local grammar_table = {"prog",
     reg_stmt = stmt * ";" * sp,
     stmt = asgn_stmt + prt_stmt + let_stmt + call_stmt + ret_stmt,
 
-    -- TODO Right now, if a variable is declared in some outer scope, in an
-    -- inner scope we can reassign the variable *and then* declare a new
-    -- variable of the same name (e.g. `let x = 2; do x = 3; let x = 4; end`).
-    -- The change made in the inner scope to the variable declared in the outer
-    -- scope will persist. After the variable of the same name is declared in
-    -- the inner scope, all assignments to that name (the shared one) will be
-    -- reflected in the new variable of the same name in the inner scope. The
-    -- new variable declared in the inner scope will go out of scope once in
-    -- the inner scope completes. Is this the behavior we want? Note that Lua
-    -- also seems to behave this way.
-    --
     -- TODO Figure out what to do when declared but unassigned variable is accessed
     -- TODO Allow multi-assignment statements?
     let_stmt = K"let" * iden * ("=" * expr)^-1 / let_stmt_ast_node,
@@ -607,8 +635,13 @@ local grammar_table = {"prog",
                     * (K"else" * stml)^-1 * K"end" / if_cnd_stmt_ast_node,
     whl_stmt = K"while" * expr * K"do" * stml * K"end" / whl_stmt_ast_node,
     do_blk_stmt = K"do" * stml * K"end" / do_blk_stmt_ast_node,
-    fn_proto_stmt = K"fn" * iden * "(" * sp * Ct(((iden * ",")^0 * iden)^0)
-                    * ")" * stml * K"end" / fn_proto_stmt_ast_node,
+
+    -- TODO Add this syntax back in. Right now, we're trying to make functions
+    -- first-class and it's a little easier to use the regular "let" assignment
+    -- first.
+    --
+    --fn_proto_stmt = K"fn" * iden * "(" * sp * Ct(((iden * ",")^0 * iden)^0)
+    --                * ")" * stml * K"end" / fn_proto_stmt_ast_node,
 
     comment = "#" * (1 - line_end)^0 * line_end,
 
@@ -689,12 +722,11 @@ repeat
         return
     end
 
-    local root_proto = 
+    local root_proto = mk_proto()
 
     -- TODO Right now we seperate variables and functions. We may not want to
     -- do this in the future.
     local initial_state = {
-        env = new_env(),
         protos = {},
     }
     local result = exec(ast, initial_state)
